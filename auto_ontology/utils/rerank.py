@@ -8,9 +8,9 @@ Mirrors :mod:`auto_ontology.utils.embedding`: the endpoint, model, and API key
 are read from the environment here. Two request schemas are in use, picked by
 the URL, and each built-in default uses a different one:
 
-* ``…/rerank`` (inference-api, ``sk-`` keys) --
-  ``{"query": str, "documents": [str], "top_n"}``, scored by
-  ``results[].relevance_score``.
+* ``…/rerank`` or ``…/reranks`` (inference-api / Alibaba Bailian DashScope,
+  ``sk-`` keys) -- ``{"query": str, "documents": [str], "top_n"}``, scored by
+  ``results[].relevance_score``. DashScope spells the path ``/reranks``.
 * ``…/reranking`` or ``…/ranking`` (NIM, ``nvapi-`` keys) --
   ``{"query": {"text"}, "passages": [{"text"}], "truncate"}``, scored by
   ``rankings[].logit``.
@@ -47,7 +47,7 @@ def get_rerank_kwargs() -> dict[str, str]:
 
 def _ranking_url(endpoint: str) -> str:
     url = endpoint.rstrip("/")
-    if url.endswith(("/reranking", "/ranking", "/rerank")):
+    if url.endswith(("/reranking", "/ranking", "/rerank", "/reranks")):
         return url
     return f"{url}/v1/ranking"
 
@@ -56,7 +56,7 @@ def _scores(
     query: str, documents: list[str], *, url: str, model_name: str, api_key: str
 ) -> list[float]:
     """One score per document, higher is better; ``-inf`` for any not returned."""
-    v1 = url.endswith("/rerank")
+    v1 = url.endswith(("/rerank", "/reranks"))
     if v1:
         payload: dict[str, Any] = {
             "model": model_name,

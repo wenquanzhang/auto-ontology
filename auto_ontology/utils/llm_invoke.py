@@ -221,25 +221,39 @@ def _build_client(
 ) -> BaseChatModel:
     """Build a chat client for the given model/endpoint.
 
-    OpenAI-family models (``openai/``, ``azure/``, ``aws/`` prefixes) go through
-    ``ChatOpenAI``, which supports structured output. Everything else uses
+    OpenAI-family models (``openai/``, ``azure/``, ``aws/`` prefixes) and any
+    DashScope (Alibaba Model Studio) endpoint go through ``ChatOpenAI``, which
+    supports ``json_schema`` structured output. Everything else uses
     ``ChatNVIDIA``.
+
+    DashScope is matched by endpoint rather than model name: ``qwen3.8-flash``
+    carries no vendor prefix, but the hosted Qwen API is OpenAI-compatible. Its
+    json_schema mode rejects ``max_tokens`` (a truncated JSON fails validation),
+    so that field is deliberately omitted there; ``temperature`` is sent
+    explicitly and thinking is disabled to keep batch extraction deterministic.
+    Other OpenAI-compatible endpoints keep the old behaviour, because gpt-5.x /
+    o-series reject an explicit ``temperature``.
     """
-    if model.startswith(("openai/", "azure/", "aws/")):
+    is_dashscope = "dashscope.aliyuncs.com" in base_url
+    if model.startswith(("openai/", "azure/", "aws/")) or is_dashscope:
         from langchain_openai import ChatOpenAI
 
-        return ChatOpenAI(
+        kwargs = dict(
             model=model,
             api_key=api_key,
             base_url=base_url,
-            # temperature omitted: gpt-5.x/o-series reject any explicit value and
-            # only allow the server default (1). Unset => langchain sends no
-            # temperature field, so the provider default applies.
-            # temperature=temperature,
-            max_tokens=max_tokens,
             timeout=LLM_INVOKE_TIMEOUT_S,
             max_retries=0,
         )
+        if is_dashscope:
+            kwargs.update(
+                temperature=temperature,
+                extra_body={"enable_thinking": False},
+            )
+        else:
+            # temperature omitted: gpt-5.x/o-series reject any explicit value.
+            kwargs["max_tokens"] = max_tokens
+        return ChatOpenAI(**kwargs)
 
     from langchain_nvidia_ai_endpoints import ChatNVIDIA
 

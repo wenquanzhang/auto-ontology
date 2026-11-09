@@ -4,11 +4,14 @@
 
 """Text embedding against the configured NIM / inference-api endpoint.
 
-Both endpoints speak the OpenAI ``/embeddings`` API, plus three NVIDIA fields
-sent through ``extra_body``. ``input_type`` is the one that matters: NVIDIA's
+Both endpoints speak the OpenAI ``/embeddings`` API. NVIDIA adds three vendor
+fields through ``extra_body``; ``input_type`` is the one that matters: NVIDIA's
 embedding models are asymmetric, so a stored row must be embedded as a
 ``passage`` and a search string as a ``query``. Mixing them up raises no error
--- it just makes every search worse.
+-- it just makes every search worse. Alibaba Bailian (DashScope) instead uses
+``text_type`` (``document`` / ``query``) and needs an explicit ``dimensions``
+to match the pgvector column. The vendor fields are chosen from the endpoint,
+so switching providers needs no code change.
 
 Some deployments ignore ``input_type`` (see ``_TEXT_PREFIXED_MODELS``); for
 those the type is written into the text as a ``query: `` / ``passage: ``
@@ -52,6 +55,25 @@ InputType = Literal["passage", "query"]
 # ``nvidia/nemotron-3.5-embed-1b`` on build.nvidia.com honours ``input_type``.
 _TEXT_PREFIXED_MODELS = ("nemotron-3.5-embed-1b-nvfp4",)
 
+# Alibaba Bailian (DashScope) speaks the same /embeddings API with different
+# vendor fields: ``text_type`` replaces NVIDIA's ``input_type``, and the output
+# width must be requested explicitly because the pgvector column is
+# halfvec(2048) while the service defaults to 1024. Detect it by host so a
+# mixed deployment keeps both behaviours.
+_DASHSCOPE_HOST = "dashscope.aliyuncs.com"
+_DASHSCOPE_DIMENSIONS = 2048
+_DASHSCOPE_BATCH_SIZE = 10
+_DASHSCOPE_MAX_CONCURRENT = 8
+# NVIDIA's hosted embeddings intermittently 500 on multi-item input arrays;
+# one item per request at low concurrency is the safe fallback there.
+_NVIDIA_BATCH_SIZE = 1
+_NVIDIA_MAX_CONCURRENT = 2
+
+
+def _is_dashscope(endpoint: str) -> bool:
+    return _DASHSCOPE_HOST in endpoint
+
+
 # Each field falls back to DEFAULT_MODELS_<field>.
 _EMBED_ENDPOINT = resolve("EMBED", "ENDPOINT")
 _EMBED_MODEL = resolve("EMBED", "MODEL")
@@ -93,9 +115,30 @@ class EmbedParams:
     embed_invoke_url: str
     api_key: str = field(default="", repr=False)
     embed_modality: str = "text"
-    inference_batch_size: int = 32
-    nim_http_max_concurrent: int = 32
+    # NVIDIA API catalog 的 embeddings 端点曾对多元素 input 数组随机返回 500
+    # "service inference failed"（单条请求近乎 100% 成功），所以该端点默认
+    # 单条/请求 + 低并发。DashScope 的批量上限是 10，__post_init__ 会提上去。
+    inference_batch_size: int = _NVIDIA_BATCH_SIZE
+    nim_http_max_concurrent: int = _NVIDIA_MAX_CONCURRENT
     request_timeout_s: float = 600.0
+    # None = let the provider decide (NVIDIA returns its native width).
+    dimensions: int | None = None
+
+    def __post_init__(self) -> None:
+        """Fill DashScope defaults without overriding explicit caller choices.
+
+        Every construction site (``get_embed_params``, ``build_semantic_embedder``
+        and ``semantic_fk._build_retriever``) uses the class defaults, so a
+        provider switch needs no call-site edits.
+        """
+        if not _is_dashscope(self.embed_invoke_url):
+            return
+        if self.dimensions is None:
+            object.__setattr__(self, "dimensions", _DASHSCOPE_DIMENSIONS)
+        if self.inference_batch_size == _NVIDIA_BATCH_SIZE:
+            object.__setattr__(self, "inference_batch_size", _DASHSCOPE_BATCH_SIZE)
+        if self.nim_http_max_concurrent == _NVIDIA_MAX_CONCURRENT:
+            object.__setattr__(self, "nim_http_max_concurrent", _DASHSCOPE_MAX_CONCURRENT)
 
 
 def get_embed_params() -> EmbedParams:
@@ -185,18 +228,27 @@ def embed_texts(
     prefix = _text_prefix(params.model_name, input_type)
 
     def _embed_batch(indices: tuple[int, ...]) -> None:
-        response = client.embeddings.create(
-            model=params.model_name,
-            input=[prefix + stripped[i] for i in indices],
-            encoding_format="float",
-            extra_body={
+        if _is_dashscope(params.embed_invoke_url):
+            extra_body: dict[str, Any] = {
+                "text_type": "query" if input_type == "query" else "document",
+            }
+        else:
+            extra_body = {
                 "input_type": input_type,
                 "truncate": "END",
                 "modality": params.embed_modality,
-            },
-            timeout=timeout or params.request_timeout_s,
-            extra_headers=None if params.api_key else _NO_AUTH,
-        )
+            }
+        request: dict[str, Any] = {
+            "model": params.model_name,
+            "input": [prefix + stripped[i] for i in indices],
+            "encoding_format": "float",
+            "extra_body": extra_body,
+            "timeout": timeout or params.request_timeout_s,
+            "extra_headers": None if params.api_key else _NO_AUTH,
+        }
+        if params.dimensions is not None:
+            request["dimensions"] = params.dimensions
+        response = client.embeddings.create(**request)
         returned = [item.index for item in response.data]
         if sorted(returned) != list(range(len(indices))):
             # Exactly one vector per input. A missing one would leave a row
